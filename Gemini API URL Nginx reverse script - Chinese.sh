@@ -3,13 +3,14 @@
 # --- 配置 ---
 NGINX_SITES_AVAILABLE="/etc/nginx/sites-available"
 NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
-NGINX_LOG_DIR="/var/log/nginx"
+# 目标是整个域名
+TARGET_DOMAIN="https://generativelanguage.googleapis.com"
+TARGET_HOST="generativelanguage.googleapis.com" # 用于 Host header
 
 # --- 颜色定义 ---
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # --- 辅助函数 ---
@@ -27,107 +28,214 @@ function print_error {
 
 function check_root {
     if [[ $EUID -ne 0 ]]; then
-       print_error "此脚本需要以 root 权限运行。请使用 'sudo ./remove_nginx_proxy.sh' 运行。"
+       print_error "此脚本需要以 root 权限运行。请使用 'sudo ./setup_google_api_proxy.sh' 运行。"
        exit 1
     fi
 }
 
+function check_nginx {
+    if ! command -v nginx &> /dev/null; then
+        print_error "未找到 Nginx。请先安装 Nginx (例如: 'sudo apt update && sudo apt install nginx' 或 'sudo yum install nginx')。"
+        exit 1
+    fi
+    print_info "检测到 Nginx 已安装。"
+}
+
 # --- 主逻辑 ---
 clear
-print_info "Nginx 反向代理配置移除脚本"
+print_info "欢迎使用 Google API (generativelanguage.googleapis.com) 全域名 Nginx 反向代理配置脚本"
 print_warning "--------------------------------------------------"
-print_warning "此脚本将帮助您删除 Nginx 代理配置文件、符号链接和相关日志。"
-print_warning "请仔细确认要删除的文件名，误删可能导致 Nginx 无法正常工作！"
+print_warning "重要提示:"
+print_warning "1. API Key 安全: 强烈建议让客户端在请求时提供 API Key (通过 Header 或 URL 参数)。"
+print_warning "   脚本生成的配置默认不包含 API Key，您需要在客户端请求中添加它。"
+print_warning "2. HTTPS: 强烈建议为您的代理启用 HTTPS，以保护通信安全。"
 print_warning "--------------------------------------------------"
 echo
 
-# 1. 检查权限
+# 1. 检查权限和 Nginx
 check_root
+check_nginx
 echo
 
-# 2. 列出可能的配置文件供用户选择
-print_info "在 '$NGINX_SITES_AVAILABLE' 中找到的可能配置文件:"
-echo -e "${CYAN}"
-ls -1 "$NGINX_SITES_AVAILABLE" | grep -E '(proxy|google|gemini)' || echo "  (未找到明显匹配 'proxy', 'google' 或 'gemini' 的文件)"
-echo -e "${NC}"
-print_info "在 '$NGINX_SITES_ENABLED' 中启用的站点 (符号链接):"
-echo -e "${CYAN}"
-ls -l "$NGINX_SITES_ENABLED" | grep -E '(proxy|google|gemini)' || echo "  (未找到明显匹配 'proxy', 'google' 或 'gemini' 的链接)"
-ls -l "$NGINX_SITES_ENABLED" | grep -v -E '(proxy|google|gemini)' # 显示其他文件以防万一
-echo -e "${NC}"
-echo
+# 2. 获取用户输入
+read -p "请输入您的服务器域名或公共 IP 地址: " server_name
+while [[ -z "$server_name" ]]; do
+    print_warning "服务器域名或 IP 地址不能为空。"
+    read -p "请输入您的服务器域名或公共 IP 地址: " server_name
+done
 
-# 3. 获取用户要删除的配置文件名
-read -p "请输入您要彻底删除的配置文件的【完整文件名】(位于 $NGINX_SITES_AVAILABLE 目录下): " config_filename
+read -p "请输入您希望在服务器上访问 Google API 的路径前缀 (必须以 / 开头和结尾, 例如 /google-api/): " proxy_location
+# 验证路径格式
+while ! [[ "$proxy_location" =~ ^/.*\/$ ]]; do
+    print_warning "路径前缀格式无效。必须以 / 开头和结尾 (例如 /google-api/ )。"
+    read -p "请重新输入路径前缀: " proxy_location
+done
 
-# 检查输入是否为空
-if [[ -z "$config_filename" ]]; then
-    print_error "未输入文件名。操作中止。"
-    exit 1
-fi
+config_file_name="google-api-proxy-${server_name//./_}.conf" # 基于域名/IP生成文件名
+config_file_path="${NGINX_SITES_AVAILABLE}/${config_file_name}"
+link_path="${NGINX_SITES_ENABLED}/${config_file_name}"
 
-config_file_path="${NGINX_SITES_AVAILABLE}/${config_filename}"
-link_path="${NGINX_SITES_ENABLED}/${config_filename}" # 假设链接名和文件名相同，这是脚本创建时的行为
-log_filename_base="${config_filename%.conf}" # 去掉 .conf 后缀作为日志文件基础名
-access_log_path="${NGINX_LOG_DIR}/${log_filename_base}.access.log"
-error_log_path="${NGINX_LOG_DIR}/${log_filename_base}.error.log"
+read -p "是否需要配置 HTTPS (需要您准备好 SSL 证书)? (y/n, 默认 n): " use_https
+use_https=$(echo "$use_https" | tr '[:upper:]' '[:lower:]') # 转小写
 
-# 4. 确认文件存在性并最终确认
-if [[ ! -f "$config_file_path" ]]; then
-    print_error "配置文件 '$config_file_path' 不存在！请检查您输入的文件名。"
-    exit 1
-fi
+ssl_cert_path=""
+ssl_key_path=""
+listen_directive="listen 80;"
+ssl_config_block=""
+proxy_scheme="http" # 用于最终提示用户访问的协议
 
-echo
-print_warning "将要执行以下删除操作:"
-print_warning "  - 删除符号链接: $link_path"
-print_warning "  - 删除配置文件: $config_file_path"
-print_warning "  - 删除访问日志: $access_log_path (如果存在)"
-print_warning "  - 删除错误日志: $error_log_path (如果存在)"
-echo
-read -p "$(echo -e ${RED}"!!! 此操作不可恢复，确定要删除吗? (y/n): "${NC})" confirmation
-confirmation=$(echo "$confirmation" | tr '[:upper:]' '[:lower:]')
+if [[ "$use_https" == "y" ]]; then
+    listen_directive="listen 443 ssl http2;"
+    proxy_scheme="https"
+    print_info "已选择启用 HTTPS。"
+    while [[ -z "$ssl_cert_path" ]]; do
+        read -p "请输入 SSL 证书文件的完整路径 (例如 /etc/letsencrypt/live/yourdomain.com/fullchain.pem): " ssl_cert_path
+        if [[ -z "$ssl_cert_path" ]]; then
+            print_warning "证书路径不能为空。"
+        fi
+    done
+     while [[ -z "$ssl_key_path" ]]; do
+        read -p "请输入 SSL 私钥文件的完整路径 (例如 /etc/letsencrypt/live/yourdomain.com/privkey.pem): " ssl_key_path
+         if [[ -z "$ssl_key_path" ]]; then
+            print_warning "私钥路径不能为空。"
+        fi
+    done
 
-if [[ "$confirmation" != "y" ]]; then
-    print_info "操作已取消。"
-    exit 0
-fi
+    # 构建 SSL 配置块
+    ssl_config_block=$(cat <<EOF
+        # --- SSL 配置 ---
+        ssl_certificate $ssl_cert_path;
+        ssl_certificate_key $ssl_key_path;
 
-# 5. 执行删除
-print_info "正在删除符号链接: $link_path"
-rm -f "$link_path"
-if [[ $? -eq 0 ]]; then
-    print_info "符号链接删除成功。"
+        # 推荐的 SSL 参数 (如果使用 Let's Encrypt, 可以包含它们的推荐配置)
+        # include /etc/letsencrypt/options-ssl-nginx.conf; # 取消注释并确保此文件存在
+        # ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;   # 取消注释并确保此文件存在
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_prefer_server_ciphers off;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+EOF
+)
+    print_info "HTTPS 配置准备就绪。"
 else
-    print_warning "删除符号链接失败或链接不存在。" # 即使失败也继续尝试删除配置文件
+    print_info "已选择使用 HTTP (不推荐用于生产环境)。"
 fi
+echo
 
-print_info "正在删除配置文件: $config_file_path"
-rm -f "$config_file_path"
+# 3. 生成 Nginx 配置内容
+print_info "正在生成 Nginx 配置文件..."
+
+# 使用 heredoc 创建配置文件内容
+# 注意 proxy_pass 的末尾有 /
+nginx_config=$(cat <<EOF
+server {
+    $listen_directive
+    server_name $server_name;
+
+$ssl_config_block
+
+    # 可选：增加允许的请求体大小
+    # client_max_body_size 50M;
+
+    # --- Google API 全域名反向代理配置 ---
+    location $proxy_location {
+        # 代理目标地址 (末尾的 / 很重要, 它会替换 location 匹配的部分)
+        proxy_pass ${TARGET_DOMAIN}/;
+
+        # 设置必要的请求头
+        proxy_set_header Host $TARGET_HOST; # 必须设置正确的目标 Host
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Accept-Encoding ""; # 防止 Nginx 自动压缩可能引起的问题
+
+        # SSL 相关配置 (与 HTTPS 后端通信)
+        proxy_ssl_server_name on; # 必须开启，以支持 SNI
+        # proxy_ssl_verify on;    # 建议开启后端 SSL 证书验证 (需要 Nginx 能访问 CA 证书)
+        # proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; # CA 证书包路径 (根据系统调整)
+        # 如果遇到 SSL 验证问题，可临时设置为 off 测试，但不推荐:
+        # proxy_ssl_verify off;
+
+        # 超时和缓冲设置 (根据需要调整)
+        # proxy_connect_timeout 60s;
+        # proxy_send_timeout   120s; # 对于可能耗时长的 API 调用，可适当增加
+        # proxy_read_timeout   120s;
+        proxy_buffering off;      # 对于流式 API (如 Gemini streamGenerateContent) 或 SSE，建议关闭缓冲
+        proxy_http_version 1.1;   # 推荐使用 HTTP/1.1 与后端通信
+        proxy_set_header Connection ""; # 清理 Connection 头，利于管理长连接
+
+        # --- API Key 处理 ---
+        # !! 强烈推荐：由客户端在请求中提供 API Key !!
+        # Nginx 默认会转发客户端的 'x-goog-api-key' Header 或 URL 中的 'key' 参数
+        # 客户端调用示例 (Header):
+        # curl -H "x-goog-api-key: YOUR_API_KEY" ... ${proxy_scheme}://$server_name${proxy_location}v1beta/models/gemini-pro:generateContent
+        # 客户端调用示例 (URL 参数):
+        # curl ... "${proxy_scheme}://$server_name${proxy_location}v1beta/models/gemini-pro:generateContent?key=YOUR_API_KEY"
+
+        # --- 不推荐：在 Nginx 中添加 API Key (安全风险) ---
+        # 如果您确认要这样做并了解风险，取消下面一行的注释并替换 Key
+        # proxy_set_header x-goog-api-key YOUR_ACTUAL_GEMINI_API_KEY;
+        # 注意：请务必严格保护此 Nginx 配置文件的访问权限！
+    }
+
+    # 可选：处理根路径或其他路径
+    location / {
+        # 返回禁止访问，避免暴露服务器信息
+        return 403 "Forbidden - Access via API proxy path ${proxy_location}";
+    }
+
+    # 日志文件路径
+    access_log /var/log/nginx/${config_file_name}.access.log;
+    error_log /var/log/nginx/${config_file_name}.error.log;
+}
+EOF
+)
+
+# 4. 写入配置文件
+print_info "正在将配置写入到: $config_file_path"
+# 使用 sudo tee 来写入需要 root 权限的文件
+echo "$nginx_config" | sudo tee "$config_file_path" > /dev/null
 if [[ $? -ne 0 ]]; then
-    print_error "删除配置文件 '$config_file_path' 失败！请检查权限。"
-    # 即使配置文件删除失败，也尝试删除日志，但最后退出码应为失败
-    error_occurred=1
-else
-    print_info "配置文件删除成功。"
+    print_error "写入配置文件失败！请检查权限或磁盘空间。"
+    exit 1
 fi
-
-print_info "正在尝试删除日志文件..."
-rm -f "$access_log_path" && print_info "访问日志已删除 (如果存在)。" || print_warning "无法删除访问日志或文件不存在。"
-rm -f "$error_log_path" && print_info "错误日志已删除 (如果存在)。" || print_warning "无法删除错误日志或文件不存在。"
+print_info "配置文件已成功创建。"
 echo
 
-# 6. 提示后续操作
-print_info "删除操作完成。建议执行以下命令检查并应用更改："
+# 5. 创建符号链接
+print_info "正在启用配置 (创建符号链接)..."
+# 使用 -f 强制覆盖可能存在的旧链接
+sudo ln -sf "$config_file_path" "$link_path"
+if [[ $? -ne 0 ]]; then
+    print_error "创建符号链接失败！"
+    exit 1
+fi
+print_info "配置已启用: $link_path -> $config_file_path"
+echo
+
+# 6. 完成与后续步骤
+print_info "--------------------------------------------------"
+print_info "配置完成！"
+print_info "--------------------------------------------------"
+echo -e "${YELLOW}下一步操作:${NC}"
 echo -e "1. ${GREEN}测试 Nginx 配置语法:${NC}"
 echo -e "   sudo nginx -t"
 echo
-echo -e "2. ${GREEN}如果测试成功，重新加载 Nginx 服务:${NC}"
+echo -e "2. ${GREEN}如果测试成功 (显示 'syntax is ok' 和 'test is successful')，重新加载 Nginx 服务:${NC}"
 echo -e "   sudo systemctl reload nginx"
 echo
+echo -e "3. ${GREEN}使用您的反向代理:${NC}"
+echo -e "   现在您可以通过 '${proxy_scheme}://$server_name${proxy_location}' 加上 Google API 的实际路径来访问。"
+echo -e "   例如，访问 Gemini Pro 模型生成内容:"
+echo -e "   ${YELLOW}POST ${proxy_scheme}://$server_name${proxy_location}v1beta/models/gemini-pro:generateContent${NC}"
+echo -e "   访问 Gemini Pro Vision 模型:"
+echo -e "   ${YELLOW}POST ${proxy_scheme}://$server_name${proxy_location}v1beta/models/gemini-pro-vision:generateContent${NC}"
+echo -e "   访问列出模型:"
+echo -e "   ${YELLOW}GET ${proxy_scheme}://$server_name${proxy_location}v1beta/models${NC}"
+echo
+echo -e "   ${YELLOW}重要:${NC} 请确保在您的客户端请求中包含 Google API Key，通过 HTTP Header ('x-goog-api-key: YOUR_API_KEY') 或 URL 参数 ('?key=YOUR_API_KEY')。"
+echo
+print_warning "请再次确认您的防火墙设置，确保端口 80 (HTTP) 和/或 443 (HTTPS) 已对外部开放。"
+print_info "脚本执行完毕。"
 
-if [[ $error_occurred -eq 1 ]]; then
-    exit 1 # 以错误码退出
-else
-    exit 0 # 正常退出
-fi
+exit 0
