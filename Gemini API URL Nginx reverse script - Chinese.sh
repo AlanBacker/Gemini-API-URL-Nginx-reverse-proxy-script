@@ -135,7 +135,7 @@ server {
 $ssl_config_block
 
     # 可选：增加允许的请求体大小
-    # client_max_body_size 50M;
+    client_max_body_size 50M;
 
     # --- Google API 全域名反向代理配置 ---
     location $proxy_location {
