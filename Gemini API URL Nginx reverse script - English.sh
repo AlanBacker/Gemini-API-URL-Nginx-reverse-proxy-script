@@ -147,7 +147,7 @@ server {
 $ssl_config_block
 
     # Optional: Increase max allowed request body size if needed for large inputs
-    # client_max_body_size 50M;
+    client_max_body_size 50M;
 
     # --- Google API Full Domain Reverse Proxy ---
     location $proxy_location {
